@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Facebook, Inc.
+ * Copyright 2016-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,12 +38,13 @@ class SimpleObservable {
     folly::Synchronized<std::shared_ptr<const T>> value_;
     folly::Synchronized<folly::Function<void()>> callback_;
   };
+  struct Wrapper;
   std::shared_ptr<Context> context_;
 
   std::once_flag observerInit_;
   folly::Optional<Observer<T>> observer_;
 };
-}
-}
+} // namespace observer
+} // namespace folly
 
 #include <folly/experimental/observer/SimpleObservable-inl.h>

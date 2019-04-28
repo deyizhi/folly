@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Facebook, Inc.
+ * Copyright 2012-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,24 +16,29 @@
 
 #include <folly/Optional.h>
 #include <folly/Portability.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
-#include <memory>
-#include <vector>
 #include <algorithm>
+#include <initializer_list>
 #include <iomanip>
+#include <memory>
 #include <string>
+#include <tuple>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
 #include <boost/optional.hpp>
 
-using std::unique_ptr;
 using std::shared_ptr;
+using std::unique_ptr;
 
 namespace folly {
 
-template<class V>
+namespace {
+
+template <class V>
 std::ostream& operator<<(std::ostream& os, const Optional<V>& v) {
   if (v) {
     os << "Optional(" << v.value() << ')';
@@ -48,6 +53,8 @@ struct NoDefault {
   char a, b, c;
 };
 
+} // namespace
+
 static_assert(sizeof(Optional<char>) == 2, "");
 static_assert(sizeof(Optional<int>) == 8, "");
 static_assert(sizeof(Optional<NoDefault>) == 4, "");
@@ -56,6 +63,18 @@ static_assert(sizeof(Optional<short>) == sizeof(boost::optional<short>), "");
 static_assert(sizeof(Optional<int>) == sizeof(boost::optional<int>), "");
 static_assert(sizeof(Optional<double>) == sizeof(boost::optional<double>), "");
 
+TEST(Optional, ConstexprConstructible) {
+  // Use FOLLY_STORAGE_CONSTEXPR to work around MSVC not taking this.
+  static FOLLY_STORAGE_CONSTEXPR Optional<int> opt;
+  // NOTE: writing `opt = none` instead of `opt(none)` causes gcc to reject this
+  // code, claiming that the (non-constexpr) move ctor of `Optional` is being
+  // invoked.
+  static FOLLY_STORAGE_CONSTEXPR Optional<int> opt2(none);
+
+  EXPECT_FALSE(opt.has_value());
+  EXPECT_FALSE(opt2.has_value());
+}
+
 TEST(Optional, NoDefault) {
   Optional<NoDefault> x;
   EXPECT_FALSE(x);
@@ -63,6 +82,28 @@ TEST(Optional, NoDefault) {
   EXPECT_TRUE(bool(x));
   x.clear();
   EXPECT_FALSE(x);
+}
+
+TEST(Optional, Emplace) {
+  Optional<std::vector<int>> opt;
+  auto& values1 = opt.emplace(3, 4);
+  EXPECT_THAT(values1, testing::ElementsAre(4, 4, 4));
+  auto& values2 = opt.emplace(2, 5);
+  EXPECT_THAT(values2, testing::ElementsAre(5, 5));
+}
+
+TEST(Optional, EmplaceInitializerList) {
+  Optional<std::vector<int>> opt;
+  auto& values1 = opt.emplace({3, 4, 5});
+  EXPECT_THAT(values1, testing::ElementsAre(3, 4, 5));
+  auto& values2 = opt.emplace({4, 5, 6});
+  EXPECT_THAT(values2, testing::ElementsAre(4, 5, 6));
+}
+
+TEST(Optional, Reset) {
+  Optional<int> opt(3);
+  opt.reset();
+  EXPECT_FALSE(opt);
 }
 
 TEST(Optional, String) {
@@ -110,8 +151,10 @@ TEST(Optional, Simple) {
   EXPECT_FALSE(bool(opt));
 }
 
+namespace {
+
 class MoveTester {
-public:
+ public:
   /* implicit */ MoveTester(const char* s) : s_(s) {}
   MoveTester(const MoveTester&) = default;
   MoveTester(MoveTester&& other) noexcept {
@@ -124,7 +167,8 @@ public:
     other.s_ = "";
     return *this;
   }
-private:
+
+ private:
   friend bool operator==(const MoveTester& o1, const MoveTester& o2);
   std::string s_;
 };
@@ -132,6 +176,8 @@ private:
 bool operator==(const MoveTester& o1, const MoveTester& o2) {
   return o1.s_ == o2.s_;
 }
+
+} // namespace
 
 TEST(Optional, value_or_rvalue_arg) {
   Optional<MoveTester> opt;
@@ -156,7 +202,7 @@ TEST(Optional, value_or_rvalue_arg) {
   EXPECT_EQ("meow", opt.value_or(dflt));
   EXPECT_EQ("hello", dflt);
   EXPECT_EQ("meow", opt.value_or(std::move(dflt)));
-  EXPECT_EQ("hello", dflt);  // only moved if used
+  EXPECT_EQ("hello", dflt); // only moved if used
 }
 
 TEST(Optional, value_or_noncopyable) {
@@ -166,7 +212,7 @@ TEST(Optional, value_or_noncopyable) {
 }
 
 struct ExpectingDeleter {
-  explicit ExpectingDeleter(int expected) : expected(expected) { }
+  explicit ExpectingDeleter(int expected_) : expected(expected_) {}
   int expected;
   void operator()(const int* ptr) {
     EXPECT_EQ(*ptr, expected);
@@ -174,23 +220,10 @@ struct ExpectingDeleter {
   }
 };
 
-TEST(Optional, value_life_extention) {
-  // Extends the life of the value.
-  const auto& ptr = Optional<std::unique_ptr<int, ExpectingDeleter>>(
-      {new int(42), ExpectingDeleter{1337}}).value();
-  *ptr = 1337;
-}
-
 TEST(Optional, value_move) {
   auto ptr = Optional<std::unique_ptr<int, ExpectingDeleter>>(
-      {new int(42), ExpectingDeleter{1337}}).value();
-  *ptr = 1337;
-}
-
-TEST(Optional, dereference_life_extention) {
-  // Extends the life of the value.
-  const auto& ptr = *Optional<std::unique_ptr<int, ExpectingDeleter>>(
-      {new int(42), ExpectingDeleter{1337}});
+                 {new int(42), ExpectingDeleter{1337}})
+                 .value();
   *ptr = 1337;
 }
 
@@ -209,6 +242,21 @@ TEST(Optional, EmptyConstruct) {
   EXPECT_FALSE(bool(test2));
 }
 
+TEST(Optional, InPlaceConstruct) {
+  using A = std::pair<int, double>;
+  Optional<A> opt(in_place, 5, 3.2);
+  EXPECT_TRUE(bool(opt));
+  EXPECT_EQ(5, opt->first);
+}
+
+TEST(Optional, InPlaceNestedConstruct) {
+  using A = std::pair<int, double>;
+  Optional<Optional<A>> opt(in_place, in_place, 5, 3.2);
+  EXPECT_TRUE(bool(opt));
+  EXPECT_TRUE(bool(*opt));
+  EXPECT_EQ(5, (*opt)->first);
+}
+
 TEST(Optional, Unique) {
   Optional<unique_ptr<int>> opt;
 
@@ -221,10 +269,10 @@ TEST(Optional, Unique) {
 
   opt.clear();
   // empty->moved
-  opt = unique_ptr<int>(new int(6));
+  opt = std::make_unique<int>(6);
   EXPECT_EQ(6, **opt);
   // full->moved
-  opt = unique_ptr<int>(new int(7));
+  opt = std::make_unique<int>(7);
   EXPECT_EQ(7, **opt);
 
   // move it out by move construct
@@ -276,18 +324,18 @@ TEST(Optional, Shared) {
 
 TEST(Optional, Order) {
   std::vector<Optional<int>> vect{
-    { none },
-    { 3 },
-    { 1 },
-    { none },
-    { 2 },
+      {none},
+      {3},
+      {1},
+      {none},
+      {2},
   };
-  std::vector<Optional<int>> expected {
-    { none },
-    { none },
-    { 1 },
-    { 2 },
-    { 3 },
+  std::vector<Optional<int>> expected{
+      {none},
+      {none},
+      {1},
+      {2},
+      {3},
   };
   std::sort(vect.begin(), vect.end());
   EXPECT_EQ(vect, expected);
@@ -316,6 +364,10 @@ TEST(Optional, Swap) {
   EXPECT_EQ("bye", a.value());
 
   swap(a, b);
+  EXPECT_TRUE(a.hasValue());
+  EXPECT_TRUE(b.hasValue());
+  EXPECT_EQ("hello", a.value());
+  EXPECT_EQ("bye", b.value());
 }
 
 TEST(Optional, Comparisons) {
@@ -374,17 +426,111 @@ TEST(Optional, Comparisons) {
   EXPECT_TRUE(boi != 2);
   EXPECT_TRUE(boi >= 1);
   EXPECT_TRUE(boi > 0);
-  EXPECT_TRUE(1 <  boi);
+  EXPECT_TRUE(1 < boi);
   EXPECT_TRUE(2 <= boi);
   EXPECT_TRUE(3 == boi);
   EXPECT_TRUE(4 != boi);
   EXPECT_TRUE(5 >= boi);
-  EXPECT_TRUE(6 >  boi);
+  EXPECT_TRUE(6 > boi);
 
   boost::optional<bool> bob(false);
   EXPECT_TRUE((bool)bob);
   EXPECT_TRUE(bob == false); // well that was confusing
   EXPECT_FALSE(bob != false);
+}
+
+TEST(Optional, HeterogeneousComparisons) {
+  using opt8 = Optional<uint8_t>;
+  using opt64 = Optional<uint64_t>;
+
+  EXPECT_TRUE(opt8(4) == uint64_t(4));
+  EXPECT_FALSE(opt8(8) == uint64_t(4));
+  EXPECT_FALSE(opt8() == uint64_t(4));
+
+  EXPECT_TRUE(uint64_t(4) == opt8(4));
+  EXPECT_FALSE(uint64_t(4) == opt8(8));
+  EXPECT_FALSE(uint64_t(4) == opt8());
+
+  EXPECT_FALSE(opt8(4) != uint64_t(4));
+  EXPECT_TRUE(opt8(8) != uint64_t(4));
+  EXPECT_TRUE(opt8() != uint64_t(4));
+
+  EXPECT_FALSE(uint64_t(4) != opt8(4));
+  EXPECT_TRUE(uint64_t(4) != opt8(8));
+  EXPECT_TRUE(uint64_t(4) != opt8());
+
+  EXPECT_TRUE(opt8() == opt64());
+  EXPECT_TRUE(opt8(4) == opt64(4));
+  EXPECT_FALSE(opt8(8) == opt64(4));
+  EXPECT_FALSE(opt8() == opt64(4));
+  EXPECT_FALSE(opt8(4) == opt64());
+
+  EXPECT_FALSE(opt8() != opt64());
+  EXPECT_FALSE(opt8(4) != opt64(4));
+  EXPECT_TRUE(opt8(8) != opt64(4));
+  EXPECT_TRUE(opt8() != opt64(4));
+  EXPECT_TRUE(opt8(4) != opt64());
+
+  EXPECT_TRUE(opt8() < opt64(4));
+  EXPECT_TRUE(opt8(4) < opt64(8));
+  EXPECT_FALSE(opt8() < opt64());
+  EXPECT_FALSE(opt8(4) < opt64(4));
+  EXPECT_FALSE(opt8(8) < opt64(4));
+  EXPECT_FALSE(opt8(4) < opt64());
+
+  EXPECT_FALSE(opt8() > opt64(4));
+  EXPECT_FALSE(opt8(4) > opt64(8));
+  EXPECT_FALSE(opt8() > opt64());
+  EXPECT_FALSE(opt8(4) > opt64(4));
+  EXPECT_TRUE(opt8(8) > opt64(4));
+  EXPECT_TRUE(opt8(4) > opt64());
+
+  EXPECT_TRUE(opt8() <= opt64(4));
+  EXPECT_TRUE(opt8(4) <= opt64(8));
+  EXPECT_TRUE(opt8() <= opt64());
+  EXPECT_TRUE(opt8(4) <= opt64(4));
+  EXPECT_FALSE(opt8(8) <= opt64(4));
+  EXPECT_FALSE(opt8(4) <= opt64());
+
+  EXPECT_FALSE(opt8() >= opt64(4));
+  EXPECT_FALSE(opt8(4) >= opt64(8));
+  EXPECT_TRUE(opt8() >= opt64());
+  EXPECT_TRUE(opt8(4) >= opt64(4));
+  EXPECT_TRUE(opt8(8) >= opt64(4));
+  EXPECT_TRUE(opt8(4) >= opt64());
+}
+
+TEST(Optional, NoneComparisons) {
+  using opt = Optional<int>;
+  EXPECT_TRUE(opt() == none);
+  EXPECT_TRUE(none == opt());
+  EXPECT_FALSE(opt(1) == none);
+  EXPECT_FALSE(none == opt(1));
+
+  EXPECT_FALSE(opt() != none);
+  EXPECT_FALSE(none != opt());
+  EXPECT_TRUE(opt(1) != none);
+  EXPECT_TRUE(none != opt(1));
+
+  EXPECT_FALSE(opt() < none);
+  EXPECT_FALSE(none < opt());
+  EXPECT_FALSE(opt(1) < none);
+  EXPECT_TRUE(none < opt(1));
+
+  EXPECT_FALSE(opt() > none);
+  EXPECT_FALSE(none > opt());
+  EXPECT_FALSE(none > opt(1));
+  EXPECT_TRUE(opt(1) > none);
+
+  EXPECT_TRUE(opt() <= none);
+  EXPECT_TRUE(none <= opt());
+  EXPECT_FALSE(opt(1) <= none);
+  EXPECT_TRUE(none <= opt(1));
+
+  EXPECT_TRUE(opt() >= none);
+  EXPECT_TRUE(none >= opt());
+  EXPECT_TRUE(opt(1) >= none);
+  EXPECT_FALSE(none >= opt(1));
 }
 
 TEST(Optional, Conversions) {
@@ -393,14 +539,14 @@ TEST(Optional, Conversions) {
   Optional<char*> mstr;
   Optional<int> mint;
 
-  //These don't compile
-  //bool b = mbool;
-  //short s = mshort;
-  //char* c = mstr;
-  //int x = mint;
-  //char* c(mstr);
-  //short s(mshort);
-  //int x(mint);
+  // These don't compile
+  // bool b = mbool;
+  // short s = mshort;
+  // char* c = mstr;
+  // int x = mint;
+  // char* c(mstr);
+  // short s(mshort);
+  // int x(mint);
 
   // intended explicit operator bool, for if (opt).
   bool b(mbool);
@@ -439,10 +585,40 @@ TEST(Optional, Pointee) {
   EXPECT_FALSE(get_pointer(x));
 }
 
+namespace {
+class ConstructibleWithArgsOnly {
+ public:
+  explicit ConstructibleWithArgsOnly(int, double) {}
+
+  ConstructibleWithArgsOnly() = delete;
+  ConstructibleWithArgsOnly(const ConstructibleWithArgsOnly&) = delete;
+  ConstructibleWithArgsOnly(ConstructibleWithArgsOnly&&) = delete;
+  ConstructibleWithArgsOnly& operator=(const ConstructibleWithArgsOnly&) =
+      delete;
+  ConstructibleWithArgsOnly& operator=(ConstructibleWithArgsOnly&&) = delete;
+};
+
+class ConstructibleWithInitializerListAndArgsOnly {
+ public:
+  ConstructibleWithInitializerListAndArgsOnly(std::initializer_list<int>, int) {
+  }
+
+  ConstructibleWithInitializerListAndArgsOnly() = delete;
+  ConstructibleWithInitializerListAndArgsOnly(
+      const ConstructibleWithInitializerListAndArgsOnly&) = delete;
+  ConstructibleWithInitializerListAndArgsOnly(
+      ConstructibleWithInitializerListAndArgsOnly&&) = delete;
+  ConstructibleWithInitializerListAndArgsOnly& operator=(
+      const ConstructibleWithInitializerListAndArgsOnly&) = delete;
+  ConstructibleWithInitializerListAndArgsOnly& operator=(
+      ConstructibleWithInitializerListAndArgsOnly&&) = delete;
+};
+} // namespace
+
 TEST(Optional, MakeOptional) {
   // const L-value version
   const std::string s("abc");
-  auto optStr = make_optional(s);
+  auto optStr = folly::make_optional(s);
   ASSERT_TRUE(optStr.hasValue());
   EXPECT_EQ(*optStr, "abc");
   *optStr = "cde";
@@ -451,7 +627,7 @@ TEST(Optional, MakeOptional) {
 
   // L-value version
   std::string s2("abc");
-  auto optStr2 = make_optional(s2);
+  auto optStr2 = folly::make_optional(s2);
   ASSERT_TRUE(optStr2.hasValue());
   EXPECT_EQ(*optStr2, "abc");
   *optStr2 = "cde";
@@ -460,7 +636,7 @@ TEST(Optional, MakeOptional) {
 
   // L-value reference version
   std::string& s3(s2);
-  auto optStr3 = make_optional(s3);
+  auto optStr3 = folly::make_optional(s3);
   ASSERT_TRUE(optStr3.hasValue());
   EXPECT_EQ(*optStr3, "abc");
   *optStr3 = "cde";
@@ -468,46 +644,73 @@ TEST(Optional, MakeOptional) {
 
   // R-value ref version
   unique_ptr<int> pInt(new int(3));
-  auto optIntPtr = make_optional(std::move(pInt));
+  auto optIntPtr = folly::make_optional(std::move(pInt));
   EXPECT_TRUE(pInt.get() == nullptr);
   ASSERT_TRUE(optIntPtr.hasValue());
   EXPECT_EQ(**optIntPtr, 3);
+
+  // variadic version
+  {
+    auto&& optional = make_optional<ConstructibleWithArgsOnly>(int{}, double{});
+    std::ignore = optional;
+  }
+  {
+    using Type = ConstructibleWithInitializerListAndArgsOnly;
+    auto&& optional = make_optional<Type>({int{}}, double{});
+    std::ignore = optional;
+  }
 }
 
-#if __CLANG_PREREQ(3, 6)
-# pragma clang diagnostic push
-# pragma clang diagnostic ignored "-Wself-move"
-#endif
+TEST(Optional, InitializerListConstruct) {
+  using Type = ConstructibleWithInitializerListAndArgsOnly;
+  auto&& optional = Optional<Type>{in_place, {int{}}, double{}};
+  std::ignore = optional;
+}
+
+TEST(Optional, TestDisambiguationMakeOptionalVariants) {
+  {
+    auto optional = make_optional<int>(1);
+    std::ignore = optional;
+  }
+  {
+    auto optional = make_optional(1);
+    std::ignore = optional;
+  }
+}
 
 TEST(Optional, SelfAssignment) {
   Optional<int> a = 42;
-  a = a;
+  a = static_cast<decltype(a)&>(a); // suppress self-assign warning
   ASSERT_TRUE(a.hasValue() && a.value() == 42);
 
   Optional<int> b = 23333333;
-  b = std::move(b);
+  b = static_cast<decltype(b)&&>(b); // suppress self-move warning
   ASSERT_TRUE(b.hasValue() && b.value() == 23333333);
 }
 
-#if __CLANG_PREREQ(3, 6)
-# pragma clang diagnostic pop
-#endif
+namespace {
 
 class ContainsOptional {
  public:
-  ContainsOptional() { }
-  explicit ContainsOptional(int x) : opt_(x) { }
-  bool hasValue() const { return opt_.hasValue(); }
-  int value() const { return opt_.value(); }
+  ContainsOptional() {}
+  explicit ContainsOptional(int x) : opt_(x) {}
+  bool hasValue() const {
+    return opt_.hasValue();
+  }
+  int value() const {
+    return opt_.value();
+  }
 
-  ContainsOptional(const ContainsOptional &other) = default;
-  ContainsOptional& operator=(const ContainsOptional &other) = default;
-  ContainsOptional(ContainsOptional &&other) = default;
-  ContainsOptional& operator=(ContainsOptional &&other) = default;
+  ContainsOptional(const ContainsOptional& other) = default;
+  ContainsOptional& operator=(const ContainsOptional& other) = default;
+  ContainsOptional(ContainsOptional&& other) = default;
+  ContainsOptional& operator=(ContainsOptional&& other) = default;
 
  private:
   Optional<int> opt_;
 };
+
+} // namespace
 
 /**
  * Test that a class containing an Optional can be copy and move assigned.
@@ -546,11 +749,15 @@ TEST(Optional, NoThrowDefaultConstructible) {
   EXPECT_TRUE(std::is_nothrow_default_constructible<Optional<bool>>::value);
 }
 
+namespace {
+
 struct NoDestructor {};
 
 struct WithDestructor {
   ~WithDestructor();
 };
+
+} // namespace
 
 TEST(Optional, TriviallyDestructible) {
   // These could all be static_asserts but EXPECT_* give much nicer output on
@@ -559,4 +766,58 @@ TEST(Optional, TriviallyDestructible) {
   EXPECT_TRUE(std::is_trivially_destructible<Optional<int>>::value);
   EXPECT_FALSE(std::is_trivially_destructible<Optional<WithDestructor>>::value);
 }
+
+TEST(Optional, Hash) {
+  // Test it's usable in std::unordered map (compile time check)
+  std::unordered_map<Optional<int>, Optional<int>> obj;
+  // Also check the std::hash template can be instantiated by the compiler
+  std::hash<Optional<int>>()(none);
+  std::hash<Optional<int>>()(3);
 }
+
+namespace {
+
+struct WithConstMember {
+  /* implicit */ WithConstMember(int val) : x(val) {}
+  const int x;
+};
+
+// Make this opaque to the optimizer by preventing inlining.
+FOLLY_NOINLINE void replaceWith2(Optional<WithConstMember>& o) {
+  o.emplace(2);
+}
+
+} // namespace
+
+TEST(Optional, ConstMember) {
+  // Verify that the compiler doesn't optimize out the second load of
+  // o->x based on the assumption that the field is const.
+  //
+  // Current Optional implementation doesn't defend against that
+  // assumption, thus replacing an optional where the object has const
+  // members is technically UB and would require wrapping each access
+  // to the storage with std::launder, but this prevents useful
+  // optimizations.
+  //
+  // Implementations of std::optional in both libstdc++ and libc++ are
+  // subject to the same UB. It is then reasonable to believe that
+  // major compilers don't rely on the constness assumption.
+  Optional<WithConstMember> o(1);
+  int sum = 0;
+  sum += o->x;
+  replaceWith2(o);
+  sum += o->x;
+  EXPECT_EQ(sum, 3);
+}
+
+TEST(Optional, NoneMatchesNullopt) {
+  auto op = make_optional<int>(10);
+  op = {};
+  EXPECT_FALSE(op.has_value());
+
+  op = make_optional<int>(20);
+  op = none;
+  EXPECT_FALSE(op.has_value());
+}
+
+} // namespace folly

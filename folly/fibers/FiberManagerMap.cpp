@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Facebook, Inc.
+ * Copyright 2015-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,11 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "FiberManagerMap.h"
+#include <folly/fibers/FiberManagerMap.h>
 
 #include <memory>
 #include <unordered_map>
 
+#include <folly/Function.h>
+#include <folly/ScopeGuard.h>
 #include <folly/Synchronized.h>
 #include <folly/ThreadLocal.h>
 
@@ -26,22 +28,17 @@ namespace fibers {
 
 namespace {
 
-class EventBaseOnDestructionCallback : public EventBase::LoopCallback {
- public:
-  explicit EventBaseOnDestructionCallback(EventBase& evb) : evb_(evb) {}
-  void runLoopCallback() noexcept override;
+template <typename EventBaseT>
+Function<void()> makeOnEventBaseDestructionCallback(EventBaseT& evb);
 
- private:
-  EventBase& evb_;
-};
-
+template <typename EventBaseT>
 class GlobalCache {
  public:
-  static FiberManager& get(EventBase& evb, const FiberManager::Options& opts) {
+  static FiberManager& get(EventBaseT& evb, const FiberManager::Options& opts) {
     return instance().getImpl(evb, opts);
   }
 
-  static std::unique_ptr<FiberManager> erase(EventBase& evb) {
+  static std::unique_ptr<FiberManager> erase(EventBaseT& evb) {
     return instance().eraseImpl(evb);
   }
 
@@ -55,26 +52,33 @@ class GlobalCache {
     return *ret;
   }
 
-  FiberManager& getImpl(EventBase& evb, const FiberManager::Options& opts) {
+  FiberManager& getImpl(EventBaseT& evb, const FiberManager::Options& opts) {
+    bool constructed = false;
+    SCOPE_EXIT {
+      if (constructed) {
+        evb.runOnDestruction(makeOnEventBaseDestructionCallback(evb));
+      }
+    };
+
     std::lock_guard<std::mutex> lg(mutex_);
 
     auto& fmPtrRef = map_[&evb];
 
     if (!fmPtrRef) {
-      auto loopController = make_unique<EventBaseLoopController>();
+      constructed = true;
+      auto loopController = std::make_unique<EventBaseLoopController>();
       loopController->attachEventBase(evb);
-      evb.runOnDestruction(new EventBaseOnDestructionCallback(evb));
-
-      fmPtrRef = make_unique<FiberManager>(std::move(loopController), opts);
+      fmPtrRef =
+          std::make_unique<FiberManager>(std::move(loopController), opts);
     }
 
     return *fmPtrRef;
   }
 
-  std::unique_ptr<FiberManager> eraseImpl(EventBase& evb) {
+  std::unique_ptr<FiberManager> eraseImpl(EventBaseT& evb) {
     std::lock_guard<std::mutex> lg(mutex_);
 
-    DCHECK_EQ(1, map_.count(&evb));
+    DCHECK_EQ(map_.count(&evb), 1u);
 
     auto ret = std::move(map_[&evb]);
     map_.erase(&evb);
@@ -82,27 +86,28 @@ class GlobalCache {
   }
 
   std::mutex mutex_;
-  std::unordered_map<EventBase*, std::unique_ptr<FiberManager>> map_;
+  std::unordered_map<EventBaseT*, std::unique_ptr<FiberManager>> map_;
 };
 
 constexpr size_t kEraseListMaxSize = 64;
 
+template <typename EventBaseT>
 class ThreadLocalCache {
  public:
-  static FiberManager& get(EventBase& evb, const FiberManager::Options& opts) {
+  static FiberManager& get(EventBaseT& evb, const FiberManager::Options& opts) {
     return instance()->getImpl(evb, opts);
   }
 
-  static void erase(EventBase& evb) {
+  static void erase(EventBaseT& evb) {
     for (auto& localInstance : instance().accessAllThreads()) {
-      SYNCHRONIZED(info, localInstance.eraseInfo_) {
+      localInstance.eraseInfo_.withWLock([&](auto& info) {
         if (info.eraseList.size() >= kEraseListMaxSize) {
           info.eraseAll = true;
         } else {
           info.eraseList.push_back(&evb);
         }
         localInstance.eraseRequested_ = true;
-      }
+      });
     }
   }
 
@@ -121,12 +126,12 @@ class ThreadLocalCache {
     return *ret;
   }
 
-  FiberManager& getImpl(EventBase& evb, const FiberManager::Options& opts) {
+  FiberManager& getImpl(EventBaseT& evb, const FiberManager::Options& opts) {
     eraseImpl();
 
     auto& fmPtrRef = map_[&evb];
     if (!fmPtrRef) {
-      fmPtrRef = &GlobalCache::get(evb, opts);
+      fmPtrRef = &GlobalCache<EventBaseT>::get(evb, opts);
     }
 
     DCHECK(fmPtrRef != nullptr);
@@ -139,7 +144,7 @@ class ThreadLocalCache {
       return;
     }
 
-    SYNCHRONIZED(info, eraseInfo_) {
+    eraseInfo_.withWLock([&](auto& info) {
       if (info.eraseAll) {
         map_.clear();
       } else {
@@ -151,31 +156,27 @@ class ThreadLocalCache {
       info.eraseList.clear();
       info.eraseAll = false;
       eraseRequested_ = false;
-    }
+    });
   }
 
-  std::unordered_map<EventBase*, FiberManager*> map_;
+  std::unordered_map<EventBaseT*, FiberManager*> map_;
   std::atomic<bool> eraseRequested_{false};
 
   struct EraseInfo {
     bool eraseAll{false};
-    std::vector<EventBase*> eraseList;
+    std::vector<EventBaseT*> eraseList;
   };
 
   folly::Synchronized<EraseInfo> eraseInfo_;
 };
 
-void EventBaseOnDestructionCallback::runLoopCallback() noexcept {
-  auto fm = GlobalCache::erase(evb_);
-  DCHECK(fm.get() != nullptr);
-  ThreadLocalCache::erase(evb_);
-
-  while (fm->hasTasks()) {
-    fm->loopUntilNoReady();
-    evb_.loopOnce();
-  }
-
-  delete this;
+template <typename EventBaseT>
+Function<void()> makeOnEventBaseDestructionCallback(EventBaseT& evb) {
+  return [&evb] {
+    auto fm = GlobalCache<EventBaseT>::erase(evb);
+    DCHECK(fm.get() != nullptr);
+    ThreadLocalCache<EventBaseT>::erase(evb);
+  };
 }
 
 } // namespace
@@ -183,7 +184,13 @@ void EventBaseOnDestructionCallback::runLoopCallback() noexcept {
 FiberManager& getFiberManager(
     EventBase& evb,
     const FiberManager::Options& opts) {
-  return ThreadLocalCache::get(evb, opts);
+  return ThreadLocalCache<EventBase>::get(evb, opts);
 }
+
+FiberManager& getFiberManager(
+    VirtualEventBase& evb,
+    const FiberManager::Options& opts) {
+  return ThreadLocalCache<VirtualEventBase>::get(evb, opts);
 }
-}
+} // namespace fibers
+} // namespace folly

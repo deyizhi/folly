@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Facebook, Inc.
+ * Copyright 2015-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,10 +17,12 @@
 #include <folly/experimental/TupleOps.h>
 
 #include <folly/Conv.h>
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
-namespace folly { namespace test {
+#include <glog/logging.h>
+
+namespace folly {
+namespace test {
 
 TEST(TupleOps, Copiable) {
   auto t = std::make_tuple(10, std::string("hello"), 30);
@@ -39,8 +41,10 @@ TEST(TupleOps, Copiable) {
 
 class MovableInt {
  public:
-  explicit MovableInt(int value) : value_(value) { }
-  int value() const { return value_; }
+  explicit MovableInt(int value) : value_(value) {}
+  int value() const {
+    return value_;
+  }
 
   MovableInt(MovableInt&&) = default;
   MovableInt& operator=(MovableInt&&) = default;
@@ -75,7 +79,8 @@ TEST(TupleOps, Movable) {
 template <class U, class T>
 U tupleTo(const T& input);
 
-template <class U, class T> struct TupleTo;
+template <class U, class T>
+struct TupleTo;
 
 // Base case: empty typle -> empty tuple
 template <>
@@ -88,9 +93,7 @@ struct TupleTo<std::tuple<>, std::tuple<>> {
 // Induction case: split off head element and convert it, then call tupleTo on
 // the tail.
 template <class U, class... Us, class T>
-struct TupleTo<
-  std::tuple<U, Us...>,
-  T> {
+struct TupleTo<std::tuple<U, Us...>, T> {
   static std::tuple<U, Us...> convert(const T& input) {
     return tuplePrepend(
         folly::to<U>(std::get<0>(input)),
@@ -103,7 +106,8 @@ U tupleTo(const T& input) {
   return TupleTo<U, T>::convert(input);
 }
 
-template <class S> struct TupleTo2;
+template <class S>
+struct TupleTo2;
 
 // Destructure all indexes into Ns... and use parameter pack expansion
 // to repeat the conversion for each individual element, then wrap
@@ -112,27 +116,28 @@ template <std::size_t... Ns>
 struct TupleTo2<TemplateSeq<std::size_t, Ns...>> {
   template <class U, class T>
   static U convert(const T& input) {
-    return std::make_tuple(
-        folly::to<typename std::tuple_element<Ns, U>::type>(
-            std::get<Ns>(input))...);
+    return std::make_tuple(folly::to<typename std::tuple_element<Ns, U>::type>(
+        std::get<Ns>(input))...);
   }
 };
 
-template <class U, class T,
-          class Seq = typename TemplateTupleRange<U>::type,
-          class Enable = typename std::enable_if<
-            (std::tuple_size<U>::value == std::tuple_size<T>::value)>::type>
+template <
+    class U,
+    class T,
+    class Seq = typename TemplateTupleRange<U>::type,
+    class Enable = typename std::enable_if<
+        (std::tuple_size<U>::value == std::tuple_size<T>::value)>::type>
 U tupleTo2(const T& input) {
   return TupleTo2<Seq>::template convert<U>(input);
 }
 
-#define CHECK_TUPLE_TO(converter) \
-  do { \
-    auto src = std::make_tuple(42, "50", 10); \
+#define CHECK_TUPLE_TO(converter)                                  \
+  do {                                                             \
+    auto src = std::make_tuple(42, "50", 10);                      \
     auto dest = converter<std::tuple<std::string, int, int>>(src); \
-    EXPECT_EQ("42", std::get<0>(dest)); \
-    EXPECT_EQ(50, std::get<1>(dest)); \
-    EXPECT_EQ(10, std::get<2>(dest)); \
+    EXPECT_EQ("42", std::get<0>(dest));                            \
+    EXPECT_EQ(50, std::get<1>(dest));                              \
+    EXPECT_EQ(10, std::get<2>(dest));                              \
   } while (false)
 
 TEST(TupleOps, TupleTo) {
@@ -145,4 +150,5 @@ TEST(TupleOps, TupleTo2) {
 
 #undef CHECK_TUPLE_TO
 
-}}  // namespaces
+} // namespace test
+} // namespace folly

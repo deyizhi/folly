@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Facebook, Inc.
+ * Copyright 2014-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  */
 
 #ifndef FOLLY_GEN_PARALLEL_H_
-#error This file may only be included from folly/gen/ParallelGen.h
+#error This file may only be included from folly/gen/Parallel.h
 #endif
 
 #include <folly/MPMCQueue.h>
@@ -45,11 +45,15 @@ class ClosableMPMCQueue {
     CHECK(!consumers());
   }
 
-  void openProducer() { ++producers_; }
-  void openConsumer() { ++consumers_; }
+  void openProducer() {
+    ++producers_;
+  }
+  void openConsumer() {
+    ++consumers_;
+  }
 
   void closeInputProducer() {
-    int64_t producers = producers_--;
+    size_t producers = producers_--;
     CHECK(producers);
     if (producers == 1) { // last producer
       wakeConsumer_.notifyAll();
@@ -57,7 +61,7 @@ class ClosableMPMCQueue {
   }
 
   void closeOutputConsumer() {
-    int64_t consumers = consumers_--;
+    size_t consumers = consumers_--;
     CHECK(consumers);
     if (consumers == 1) { // last consumer
       wakeProducer_.notifyAll();
@@ -85,15 +89,21 @@ class ClosableMPMCQueue {
   template <typename... Args>
   bool writeUnlessClosed(Args&&... args) {
     // write if there's room
-    while (!queue_.writeIfNotFull(std::forward<Args>(args)...)) {
-      // if write fails, check if there are still consumers listening
-      auto key = wakeProducer_.prepareWait();
-      if (!consumers()) {
-        // no consumers left; bail out
-        wakeProducer_.cancelWait();
-        return false;
+    if (!queue_.writeIfNotFull(std::forward<Args>(args)...)) {
+      while (true) {
+        auto key = wakeProducer_.prepareWait();
+        // if write fails, check if there are still consumers listening
+        if (!consumers()) {
+          // no consumers left; bail out
+          wakeProducer_.cancelWait();
+          return false;
+        }
+        if (queue_.writeIfNotFull(std::forward<Args>(args)...)) {
+          wakeProducer_.cancelWait();
+          break;
+        }
+        wakeProducer_.wait(key);
       }
-      wakeProducer_.wait(key);
     }
     // wake consumers to pick up new value
     wakeConsumer_.notify();
@@ -110,14 +120,21 @@ class ClosableMPMCQueue {
   }
 
   bool readUnlessClosed(T& out) {
-    while (!queue_.readIfNotEmpty(out)) {
-      auto key = wakeConsumer_.prepareWait();
-      if (!producers()) {
-        // wake producers to fill empty space
-        wakeProducer_.notify();
-        return false;
+    if (!queue_.readIfNotEmpty(out)) {
+      while (true) {
+        auto key = wakeConsumer_.prepareWait();
+        if (queue_.readIfNotEmpty(out)) {
+          wakeConsumer_.cancelWait();
+          break;
+        }
+        if (!producers()) {
+          wakeConsumer_.cancelWait();
+          // wake producers to fill empty space
+          wakeProducer_.notify();
+          return false;
+        }
+        wakeConsumer_.wait(key);
       }
-      wakeConsumer_.wait(key);
     }
     // wake writers blocked by full queue
     wakeProducer_.notify();
@@ -132,11 +149,12 @@ class Sub : public Operator<Sub<Sink>> {
  public:
   explicit Sub(Sink sink) : sink_(sink) {}
 
-  template <class Value,
-            class Source,
-            class Result =
-                decltype(std::declval<Sink>().compose(std::declval<Source>())),
-            class Just = SingleCopy<typename std::decay<Result>::type>>
+  template <
+      class Value,
+      class Source,
+      class Result =
+          decltype(std::declval<Sink>().compose(std::declval<Source>())),
+      class Just = SingleCopy<typename std::decay<Result>::type>>
   Just compose(const GenImpl<Value, Source>& source) const {
     return Just(source | sink_);
   }
@@ -150,25 +168,29 @@ class Parallel : public Operator<Parallel<Ops>> {
  public:
   Parallel(Ops ops, size_t threads) : ops_(std::move(ops)), threads_(threads) {}
 
-  template <class Input,
-            class Source,
-            class InputDecayed = typename std::decay<Input>::type,
-            class Composed =
-                decltype(std::declval<Ops>().compose(Empty<InputDecayed&&>())),
-            class Output = typename Composed::ValueType,
-            class OutputDecayed = typename std::decay<Output>::type>
-  class Generator : public GenImpl<OutputDecayed&&,
-                                   Generator<Input,
-                                             Source,
-                                             InputDecayed,
-                                             Composed,
-                                             Output,
-                                             OutputDecayed>> {
-    const Source source_;
-    const Ops ops_;
-    const size_t threads_;
-    typedef ClosableMPMCQueue<InputDecayed> InQueue;
-    typedef ClosableMPMCQueue<OutputDecayed> OutQueue;
+  template <
+      class Input,
+      class Source,
+      class InputDecayed = typename std::decay<Input>::type,
+      class Composed =
+          decltype(std::declval<Ops>().compose(Empty<InputDecayed&&>())),
+      class Output = typename Composed::ValueType,
+      class OutputDecayed = typename std::decay<Output>::type>
+  class Generator : public GenImpl<
+                        OutputDecayed&&,
+                        Generator<
+                            Input,
+                            Source,
+                            InputDecayed,
+                            Composed,
+                            Output,
+                            OutputDecayed>> {
+    Source source_;
+    Ops ops_;
+    size_t threads_;
+
+    using InQueue = ClosableMPMCQueue<InputDecayed>;
+    using OutQueue = ClosableMPMCQueue<OutputDecayed>;
 
     class Puller : public GenImpl<InputDecayed&&, Puller> {
       InQueue* queue_;
@@ -228,7 +250,7 @@ class Parallel : public Operator<Parallel<Ops>> {
 
       void work() {
         puller_ | *ops_ | pusher_;
-      };
+      }
 
      public:
       Executor(size_t threads, const Ops* ops)
@@ -267,9 +289,13 @@ class Parallel : public Operator<Parallel<Ops>> {
         CHECK(!outQueue_.producers());
       }
 
-      void closeInputProducer() { inQueue_.closeInputProducer(); }
+      void closeInputProducer() {
+        inQueue_.closeInputProducer();
+      }
 
-      void closeOutputConsumer() { outQueue_.closeOutputConsumer(); }
+      void closeOutputConsumer() {
+        outQueue_.closeOutputConsumer();
+      }
 
       bool writeUnlessClosed(Input&& input) {
         return inQueue_.writeUnlessClosed(std::forward<Input>(input));
@@ -293,8 +319,9 @@ class Parallel : public Operator<Parallel<Ops>> {
         : source_(std::move(source)),
           ops_(std::move(ops)),
           threads_(
-              threads ? threads
-                      : std::max<size_t>(1, sysconf(_SC_NPROCESSORS_CONF))) {}
+              threads
+                  ? threads
+                  : size_t(std::max<long>(1, sysconf(_SC_NPROCESSORS_CONF)))) {}
 
     template <class Handler>
     bool apply(Handler&& handler) const {

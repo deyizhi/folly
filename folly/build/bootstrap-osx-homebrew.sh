@@ -5,25 +5,63 @@
 # fail fast
 set -e
 
-BASE_DIR="$(cd "$(dirname -- "$0")"/.. ; pwd)"  # folly/folly
-cd "$BASE_DIR"
+BUILD_DIR=${BUILD_DIR:-_build}
 
-brewget() {
-    brew install $@ || brew upgrade $@
+# brew install alias
+brew_install() {
+    brew install "$@" || brew upgrade "$@"
 }
 
-# tool dependencies: autotools and scons (for double-conversion)
-brewget autoconf automake libtool
+# install deps
+install_deps() {
+    # folly deps
+    dependencies=(
+        boost
+        cmake
+        double-conversion
+        gflags
+        glog
+        jemalloc
+        libevent
+        lz4
+        openssl
+        pkg-config
+        snappy
+        xz
+    )
 
-# dependencies
-brewget glog gflags boost libevent double-conversion
-
-autoreconf -i
-./configure
-
-pushd test
-test -e gtest-1.7.0.zip || {
-    curl -O https://googletest.googlecode.com/files/gtest-1.7.0.zip
-    unzip gtest-1.7.0.zip
+    # fetch deps
+    for dependency in "${dependencies[@]}"; do
+        brew_install "${dependency}"
+    done
 }
-popd
+
+install_deps
+
+# Allows this script to be invoked from anywhere in the source tree but the
+# BUILD_DIR we create will always be in the top level folly directory
+TOP_LEVEL_DIR="$(cd "$(dirname -- "$0")"/../.. ; pwd)"  # folly
+cd "$TOP_LEVEL_DIR"
+mkdir -p "${BUILD_DIR}"
+cd "${BUILD_DIR}"
+
+OPENSSL_INCLUDES=$(brew --prefix openssl)/include
+cmake \
+    -DOPENSSL_INCLUDE_DIR="${OPENSSL_INCLUDES}" \
+    -DFOLLY_HAVE_WEAK_SYMBOLS=ON \
+    "$@" \
+    ..
+
+# fetch googletest, if doesn't exist
+GTEST_VER=1.8.0
+GTEST_DIR=gtest-${GTEST_VER}
+if [ ! -d ${GTEST_DIR} ]; then
+    mkdir ${GTEST_DIR}
+    curl -SL \
+        https://github.com/google/googletest/archive/release-${GTEST_VER}.tar.gz | \
+        tar -xvzf - --strip-components=1 -C ${GTEST_DIR}
+fi
+
+# make, test, install
+make
+make install

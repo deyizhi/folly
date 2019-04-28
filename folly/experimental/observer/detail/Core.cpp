@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Facebook, Inc.
+ * Copyright 2016-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,7 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include <folly/experimental/observer/detail/Core.h>
+
+#include <folly/ExceptionString.h>
 #include <folly/experimental/observer/detail/ObserverManager.h>
 
 namespace folly {
@@ -38,14 +41,17 @@ Core::VersionedData Core::getData() {
   return data_.copy();
 }
 
-size_t Core::refresh(size_t version, bool force) {
+size_t Core::refresh(size_t version) {
   CHECK(ObserverManager::inManagerThread());
+
+  ObserverManager::DependencyRecorder::markRefreshDependency(*this);
+  SCOPE_EXIT {
+    ObserverManager::DependencyRecorder::unmarkRefreshDependency(*this);
+  };
 
   if (version_ >= version) {
     return versionLastChange_;
   }
-
-  bool refreshDependents = false;
 
   {
     std::lock_guard<std::mutex> lgRefresh(refreshMutex_);
@@ -55,13 +61,23 @@ size_t Core::refresh(size_t version, bool force) {
       return versionLastChange_;
     }
 
-    bool needRefresh = force || version_ == 0;
+    bool needRefresh = std::exchange(forceRefresh_, false) || version_ == 0;
+
+    ObserverManager::DependencyRecorder dependencyRecorder(*this);
 
     // This can be run in parallel, but we expect most updates to propagate
     // bottom to top.
     dependencies_.withRLock([&](const Dependencies& dependencies) {
       for (const auto& dependency : dependencies) {
-        if (dependency->refresh(version) > version_) {
+        try {
+          if (dependency->refresh(version) > version_) {
+            needRefresh = true;
+            break;
+          }
+        } catch (...) {
+          LOG(ERROR) << "Exception while checking dependencies for updates: "
+                     << exceptionStr(std::current_exception());
+
           needRefresh = true;
           break;
         }
@@ -73,19 +89,15 @@ size_t Core::refresh(size_t version, bool force) {
       return versionLastChange_;
     }
 
-    ObserverManager::DependencyRecorder dependencyRecorder;
-
     try {
-      {
-        VersionedData newData{creator_(), version};
-        if (!newData.data) {
-          throw std::logic_error("Observer creator returned nullptr.");
-        }
-        data_.swap(newData);
+      VersionedData newData{creator_(), version};
+      if (!newData.data) {
+        throw std::logic_error("Observer creator returned nullptr.");
       }
-
-      versionLastChange_ = version;
-      refreshDependents = true;
+      if (data_.copy().data != newData.data) {
+        data_.swap(newData);
+        versionLastChange_ = version;
+      }
     } catch (...) {
       LOG(ERROR) << "Exception while refreshing Observer: "
                  << exceptionStr(std::current_exception());
@@ -97,6 +109,10 @@ size_t Core::refresh(size_t version, bool force) {
     }
 
     version_ = version;
+
+    if (versionLastChange_ != version) {
+      return versionLastChange_;
+    }
 
     auto newDependencies = dependencyRecorder.release();
     dependencies_.withWLock([&](Dependencies& dependencies) {
@@ -116,17 +132,19 @@ size_t Core::refresh(size_t version, bool force) {
     });
   }
 
-  if (refreshDependents) {
-    auto dependents = dependents_.copy();
+  auto dependents = dependents_.copy();
 
-    for (const auto& dependentWeak : dependents) {
-      if (auto dependent = dependentWeak.lock()) {
-        ObserverManager::scheduleRefresh(std::move(dependent), version);
-      }
+  for (const auto& dependentWeak : dependents) {
+    if (auto dependent = dependentWeak.lock()) {
+      ObserverManager::scheduleRefresh(std::move(dependent), version);
     }
   }
 
   return versionLastChange_;
+}
+
+void Core::setForceRefresh() {
+  forceRefresh_ = true;
 }
 
 Core::Core(folly::Function<std::shared_ptr<const void>()> creator)
@@ -163,5 +181,5 @@ void Core::removeStaleDependents() {
     }
   });
 }
-}
-}
+} // namespace observer_detail
+} // namespace folly

@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,25 +18,27 @@
 
 #include <folly/experimental/symbolizer/SignalHandler.h>
 
+#include <signal.h>
 #include <sys/types.h>
+
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <ctime>
 #include <mutex>
-#include <pthread.h>
-#include <signal.h>
-#include <unistd.h>
 #include <vector>
 
 #include <glog/logging.h>
 
 #include <folly/Conv.h>
-#include <folly/FileUtil.h>
-#include <folly/Portability.h>
 #include <folly/ScopeGuard.h>
+#include <folly/experimental/symbolizer/ElfCache.h>
 #include <folly/experimental/symbolizer/Symbolizer.h>
 #include <folly/portability/SysSyscall.h>
+#include <folly/portability/Unistd.h>
 
-namespace folly { namespace symbolizer {
+namespace folly {
+namespace symbolizer {
 
 namespace {
 
@@ -58,22 +60,20 @@ class FatalSignalCallbackRegistry {
 };
 
 FatalSignalCallbackRegistry::FatalSignalCallbackRegistry()
-  : installed_(false) {
-}
+    : installed_(false) {}
 
 void FatalSignalCallbackRegistry::add(SignalCallback func) {
   std::lock_guard<std::mutex> lock(mutex_);
-  CHECK(!installed_)
-    << "FatalSignalCallbackRegistry::add may not be used "
-       "after installing the signal handlers.";
+  CHECK(!installed_) << "FatalSignalCallbackRegistry::add may not be used "
+                        "after installing the signal handlers.";
   handlers_.push_back(func);
 }
 
 void FatalSignalCallbackRegistry::markInstalled() {
   std::lock_guard<std::mutex> lock(mutex_);
   CHECK(!installed_.exchange(true))
-    << "FatalSignalCallbackRegistry::markInstalled must be called "
-    << "at most once";
+      << "FatalSignalCallbackRegistry::markInstalled must be called "
+      << "at most once";
 }
 
 void FatalSignalCallbackRegistry::run() {
@@ -86,22 +86,29 @@ void FatalSignalCallbackRegistry::run() {
   }
 }
 
-// Leak it so we don't have to worry about destruction order
-FatalSignalCallbackRegistry* gFatalSignalCallbackRegistry =
-  new FatalSignalCallbackRegistry;
+std::atomic<FatalSignalCallbackRegistry*> gFatalSignalCallbackRegistry{};
+
+static FatalSignalCallbackRegistry* getFatalSignalCallbackRegistry() {
+  // Leak it so we don't have to worry about destruction order
+  static FatalSignalCallbackRegistry* fatalSignalCallbackRegistry =
+      new FatalSignalCallbackRegistry();
+
+  return fatalSignalCallbackRegistry;
+}
 
 struct {
   int number;
   const char* name;
   struct sigaction oldAction;
 } kFatalSignals[] = {
-  { SIGSEGV, "SIGSEGV", {} },
-  { SIGILL,  "SIGILL",  {} },
-  { SIGFPE,  "SIGFPE",  {} },
-  { SIGABRT, "SIGABRT", {} },
-  { SIGBUS,  "SIGBUS",  {} },
-  { SIGTERM, "SIGTERM", {} },
-  { 0,       nullptr,   {} }
+    {SIGSEGV, "SIGSEGV", {}},
+    {SIGILL, "SIGILL", {}},
+    {SIGFPE, "SIGFPE", {}},
+    {SIGABRT, "SIGABRT", {}},
+    {SIGBUS, "SIGBUS", {}},
+    {SIGTERM, "SIGTERM", {}},
+    {SIGQUIT, "SIGQUIT", {}},
+    {0, nullptr, {}},
 };
 
 void callPreviousSignalHandler(int signum) {
@@ -124,38 +131,24 @@ void callPreviousSignalHandler(int signum) {
   raise(signum);
 }
 
-constexpr size_t kDefaultCapacity = 500;
-
 // Note: not thread-safe, but that's okay, as we only let one thread
 // in our signal handler at a time.
 //
 // Leak it so we don't have to worry about destruction order
-auto gSignalSafeElfCache = new SignalSafeElfCache(kDefaultCapacity);
-
-// Buffered writer (using a fixed-size buffer). We try to write only once
-// to prevent interleaving with messages written from other threads.
 //
-// Leak it so we don't have to worry about destruction order.
-auto gPrinter = new FDSymbolizePrinter(STDERR_FILENO,
-                                       SymbolizePrinter::COLOR_IF_TTY,
-                                       size_t(64) << 10);  // 64KiB
-
-// Flush gPrinter, also fsync, in case we're about to crash again...
-void flush() {
-  gPrinter->flush();
-  fsyncNoInt(STDERR_FILENO);
-}
+// Initialized by installFatalSignalHandler
+SafeStackTracePrinter* gStackTracePrinter;
 
 void printDec(uint64_t val) {
   char buf[20];
   uint32_t n = uint64ToBufferUnsafe(val, buf);
-  gPrinter->print(StringPiece(buf, n));
+  gStackTracePrinter->print(StringPiece(buf, n));
 }
 
 const char kHexChars[] = "0123456789abcdef";
 void printHex(uint64_t val) {
   // TODO(tudorb): Add this to folly/Conv.h
-  char buf[2 + 2 * sizeof(uint64_t)];  // "0x" prefix, 2 digits for each byte
+  char buf[2 + 2 * sizeof(uint64_t)]; // "0x" prefix, 2 digits for each byte
 
   char* end = buf + sizeof(buf);
   char* p = end;
@@ -166,15 +159,21 @@ void printHex(uint64_t val) {
   *--p = 'x';
   *--p = '0';
 
-  gPrinter->print(StringPiece(p, end));
+  gStackTracePrinter->print(StringPiece(p, end));
 }
 
 void print(StringPiece sp) {
-  gPrinter->print(sp);
+  gStackTracePrinter->print(sp);
+}
+
+void flush() {
+  gStackTracePrinter->flush();
 }
 
 void dumpTimeInfo() {
-  SCOPE_EXIT { flush(); };
+  SCOPE_EXIT {
+    flush();
+  };
   time_t now = time(nullptr);
   print("*** Aborted at ");
   printDec(now);
@@ -252,7 +251,7 @@ const char* sigbus_reason(int si_code) {
     case BUS_OBJERR:
       return "object-specific hardware error";
 
-    // MCEERR_AR and MCEERR_AO: in sigaction(2) but not in headers.
+      // MCEERR_AR and MCEERR_AO: in sigaction(2) but not in headers.
 
     default:
       return nullptr;
@@ -266,7 +265,7 @@ const char* sigtrap_reason(int si_code) {
     case TRAP_TRACE:
       return "process trace trap";
 
-    // TRAP_BRANCH and TRAP_HWBKPT: in sigaction(2) but not in headers.
+      // TRAP_BRANCH and TRAP_HWBKPT: in sigaction(2) but not in headers.
 
     default:
       return nullptr;
@@ -336,7 +335,9 @@ const char* signal_reason(int signum, int si_code) {
 }
 
 void dumpSignalInfo(int signum, siginfo_t* siginfo) {
-  SCOPE_EXIT { flush(); };
+  SCOPE_EXIT {
+    flush();
+  };
   // Get the signal name, if possible.
   const char* name = nullptr;
   for (auto p = kFatalSignals; p->name; ++p) {
@@ -364,7 +365,7 @@ void dumpSignalInfo(int signum, siginfo_t* siginfo) {
   printDec(syscall(__NR_gettid));
 
   // Kernel-sourced signals don't give us useful info for pid/uid.
-  if (siginfo->si_code != SI_KERNEL) {
+  if (siginfo->si_code <= 0) {
     print(") (maybe from PID ");
     printDec(siginfo->si_pid);
     print(", UID ");
@@ -373,43 +374,20 @@ void dumpSignalInfo(int signum, siginfo_t* siginfo) {
 
   auto reason = signal_reason(signum, siginfo->si_code);
 
+  print(") (code: ");
+  // If we can't find a reason code make a best effort to print the (int) code.
   if (reason != nullptr) {
-    print(") (code: ");
     print(reason);
+  } else {
+    if (siginfo->si_code < 0) {
+      print("-");
+      printDec(-siginfo->si_code);
+    } else {
+      printDec(siginfo->si_code);
+    }
   }
 
   print("), stack trace: ***\n");
-}
-
-FOLLY_NOINLINE void dumpStackTrace(bool symbolize);
-
-void dumpStackTrace(bool symbolize) {
-  SCOPE_EXIT { flush(); };
-  // Get and symbolize stack trace
-  constexpr size_t kMaxStackTraceDepth = 100;
-  FrameArray<kMaxStackTraceDepth> addresses;
-
-  // Skip the getStackTrace frame
-  if (!getStackTraceSafe(addresses)) {
-    print("(error retrieving stack trace)\n");
-  } else if (symbolize) {
-    Symbolizer symbolizer(gSignalSafeElfCache);
-    symbolizer.symbolize(addresses);
-
-    // Skip the top 2 frames:
-    // getStackTraceSafe
-    // dumpStackTrace (here)
-    //
-    // Leaving signalHandler on the stack for clarity, I think.
-    gPrinter->println(addresses, 2);
-  } else {
-    print("(safe mode, symbolizer not available)\n");
-    AddressFormatter formatter;
-    for (size_t i = 0; i < addresses.frameCount; ++i) {
-      print(formatter.format(addresses.addresses[i]));
-      print("\n");
-    }
-  }
 }
 
 // On Linux, pthread_t is a pointer, so 0 is an invalid value, which we
@@ -434,7 +412,7 @@ void innerSignalHandler(int signum, siginfo_t* info, void* /* uctx */) {
       // next time around.
       if (!gInRecursiveSignalHandler.exchange(true)) {
         print("Entered fatal signal handler recursively. We're in trouble.\n");
-        dumpStackTrace(false);  // no symbolization
+        gStackTracePrinter->printStackTrace(false); // no symbolization
       }
       return;
     }
@@ -442,7 +420,7 @@ void innerSignalHandler(int signum, siginfo_t* info, void* /* uctx */) {
     // Wait a while, try again.
     timespec ts;
     ts.tv_sec = 0;
-    ts.tv_nsec = 100L * 1000 * 1000;  // 100ms
+    ts.tv_nsec = 100L * 1000 * 1000; // 100ms
     nanosleep(&ts, nullptr);
 
     prevSignalThread = kInvalidThreadId;
@@ -450,14 +428,21 @@ void innerSignalHandler(int signum, siginfo_t* info, void* /* uctx */) {
 
   dumpTimeInfo();
   dumpSignalInfo(signum, info);
-  dumpStackTrace(true);  // with symbolization
+  gStackTracePrinter->printStackTrace(true); // with symbolization
 
   // Run user callbacks
-  gFatalSignalCallbackRegistry->run();
+  auto callbacks = gFatalSignalCallbackRegistry.load(std::memory_order_acquire);
+  if (callbacks) {
+    callbacks->run();
+  }
 }
 
 void signalHandler(int signum, siginfo_t* info, void* uctx) {
-  SCOPE_EXIT { flush(); };
+  int savedErrno = errno;
+  SCOPE_EXIT {
+    flush();
+    errno = savedErrno;
+  };
   innerSignalHandler(signum, info, uctx);
 
   gSignalThread = kInvalidThreadId;
@@ -465,21 +450,37 @@ void signalHandler(int signum, siginfo_t* info, void* uctx) {
   callPreviousSignalHandler(signum);
 }
 
-}  // namespace
+} // namespace
 
 void addFatalSignalCallback(SignalCallback cb) {
-  gFatalSignalCallbackRegistry->add(cb);
+  getFatalSignalCallbackRegistry()->add(cb);
 }
 
 void installFatalSignalCallbacks() {
-  gFatalSignalCallbackRegistry->markInstalled();
+  getFatalSignalCallbackRegistry()->markInstalled();
 }
 
 namespace {
 
 std::atomic<bool> gAlreadyInstalled;
 
-}  // namespace
+// Small sigaltstack size threshold.
+// 8931 is known to cause the signal handler to stack overflow during
+// symbolization even for a simple one-liner "kill(getpid(), SIGTERM)".
+const size_t kSmallSigAltStackSize = 8931;
+
+bool isSmallSigAltStackEnabled() {
+  stack_t ss;
+  if (sigaltstack(nullptr, &ss) != 0) {
+    return false;
+  }
+  if ((ss.ss_flags & SS_DISABLE) != 0) {
+    return false;
+  }
+  return ss.ss_size <= kSmallSigAltStackSize;
+}
+
+} // namespace
 
 void installFatalSignalHandler() {
   if (gAlreadyInstalled.exchange(true)) {
@@ -487,14 +488,37 @@ void installFatalSignalHandler() {
     return;
   }
 
+  // make sure gFatalSignalCallbackRegistry is created before we
+  // install the fatal signal handler
+  gFatalSignalCallbackRegistry.store(
+      getFatalSignalCallbackRegistry(), std::memory_order_release);
+
+  // If a small sigaltstack is enabled (ex. Rust stdlib might use sigaltstack
+  // to set a small stack), the default SafeStackTracePrinter would likely
+  // stack overflow. Replace it with the unsafe self-allocate printer.
+  bool useUnsafePrinter = isSmallSigAltStackEnabled();
+  if (useUnsafePrinter) {
+    gStackTracePrinter = new UnsafeSelfAllocateStackTracePrinter();
+  } else {
+    gStackTracePrinter = new SafeStackTracePrinter();
+  }
+
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
-  sigemptyset(&sa.sa_mask);
+  if (useUnsafePrinter) {
+    // The signal handler is not async-signal-safe. Block all signals to
+    // make it safer. But it's still unsafe.
+    sigfillset(&sa.sa_mask);
+  } else {
+    sigemptyset(&sa.sa_mask);
+  }
   // By default signal handlers are run on the signaled thread's stack.
   // In case of stack overflow running the SIGSEGV signal handler on
   // the same stack leads to another SIGSEGV and crashes the program.
   // Use SA_ONSTACK, so alternate stack is used (only if configured via
   // sigaltstack).
+  // Golang also requires SA_ONSTACK. See:
+  // https://golang.org/pkg/os/signal/#hdr-Go_programs_that_use_cgo_or_SWIG
   sa.sa_flags |= SA_SIGINFO | SA_ONSTACK;
   sa.sa_sigaction = &signalHandler;
 
@@ -502,5 +526,5 @@ void installFatalSignalHandler() {
     CHECK_ERR(sigaction(p->number, &sa, &p->oldAction));
   }
 }
-
-}}  // namespaces
+} // namespace symbolizer
+} // namespace folly

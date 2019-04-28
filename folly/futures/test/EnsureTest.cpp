@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Facebook, Inc.
+ * Copyright 2015-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,9 +17,8 @@
 #include <memory>
 #include <unordered_set>
 
-#include <gtest/gtest.h>
-
 #include <folly/futures/Future.h>
+#include <folly/portability/GTest.h>
 
 using namespace folly;
 
@@ -27,11 +26,11 @@ TEST(Ensure, basic) {
   size_t count = 0;
   auto cob = [&] { count++; };
   auto f = makeFuture(42)
-    .ensure(cob)
-    .then([](int) { throw std::runtime_error("ensure"); })
-    .ensure(cob);
+               .ensure(cob)
+               .thenValue([](int) { throw std::runtime_error("ensure"); })
+               .ensure(cob);
 
-  EXPECT_THROW(f.get(), std::runtime_error);
+  EXPECT_THROW(std::move(f).get(), std::runtime_error);
   EXPECT_EQ(2, count);
 }
 
@@ -41,9 +40,9 @@ TEST(Ensure, mutableLambda) {
   set->insert(2);
 
   auto f = makeFuture(4)
-    .ensure([set]() mutable { set->clear(); })
-    .then([]() { throw std::runtime_error("ensure"); });
+               .ensure([set]() mutable { set->clear(); })
+               .thenValue([](auto&&) { throw std::runtime_error("ensure"); });
 
   EXPECT_EQ(0, set->size());
-  EXPECT_THROW(f.get(), std::runtime_error);
+  EXPECT_THROW(std::move(f).get(), std::runtime_error);
 }
